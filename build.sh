@@ -6,7 +6,8 @@
 #
 #   ./build.sh                 # full build with FMOD audio (default)
 #   SOUND=0 ./build.sh         # native build, no audio (faster; native arm64 on Apple Silicon)
-#   ARCH=arm64 ./build.sh      # force a specific architecture
+#   ARCH=arm64 SOUND=1 FMOD_DYLIB=/path/to/libfmodex.dylib ./build.sh
+#                               # native arm64 build using an FMOD compatible dylib
 #
 # Layout mirrors the Windows build: src/zandronum (source), deps/ (downloads),
 # build/ (output).  Source is NEVER patched (touchless rule).
@@ -45,17 +46,30 @@ BUNDLE_ID="org.zandronum.zandronum"
 
 HOST_ARCH="$(uname -m)"                 # arm64 | x86_64
 WANT_SOUND="${SOUND:-1}"                # 0 = native build without FMOD audio
+FMOD_DYLIB="${FMOD_DYLIB:-}"            # optional replacement FMOD compatible dylib
 
-# Decide target architecture: explicit ARCH wins; SOUND=1 forces x86_64; else native.
+# Decide target architecture: explicit ARCH wins. The legacy FMOD build defaults
+# to x86_64; a supplied replacement allows native arm64 audio builds.
 if [[ -n "${ARCH:-}" ]]; then
     TARGET_ARCH="$ARCH"
-elif [[ "$WANT_SOUND" == "1" ]]; then
+elif [[ "$WANT_SOUND" == "1" && -z "$FMOD_DYLIB" ]]; then
     TARGET_ARCH="x86_64"
 else
     TARGET_ARCH="$HOST_ARCH"
 fi
-[[ "$WANT_SOUND" == "1" && "$TARGET_ARCH" != "x86_64" ]] && \
-    { echo "ERROR: SOUND=1 requires ARCH=x86_64 (FMOD Ex has no arm64 build)." >&2; exit 1; }
+if [[ "$TARGET_ARCH" != "x86_64" && "$TARGET_ARCH" != "arm64" ]]; then
+    echo "ERROR: ARCH must be x86_64 or arm64." >&2
+    exit 1
+fi
+if [[ "$WANT_SOUND" == "1" && "$TARGET_ARCH" != "x86_64" && -z "$FMOD_DYLIB" ]]; then
+    echo "ERROR: SOUND=1 requires x86_64 or an arm64 compatible FMOD_DYLIB." >&2
+    exit 1
+fi
+
+USE_X86_DEPS=0
+if [[ "$TARGET_ARCH" == "x86_64" && ( "$WANT_SOUND" == "1" || "$HOST_ARCH" != "x86_64" ) ]]; then
+    USE_X86_DEPS=1
+fi
 
 NCPU="$(sysctl -n hw.ncpu)"
 
@@ -120,7 +134,7 @@ install_native_deps() {
     status "Installing native dependencies via Homebrew..."
     # Note: no FluidSynth -- the Windows build doesn't ship it either; MIDI uses
     # the built-in OPL synth. FMOD/Opus provide all required audio.
-    local pkgs=(sdl12-compat glew openssl@3 opus zstd) need=()
+    local pkgs=(sdl12-compat sdl2-compat glew openssl@3 opus zstd) need=()
     for p in "${pkgs[@]}"; do
         brew list --versions "$p" >/dev/null 2>&1 || need+=("$p")
     done
@@ -128,7 +142,7 @@ install_native_deps() {
 }
 
 # ---------------------------------------------------------------------------
-# x86_64 dependencies built from source (SOUND=1 path)
+# x86_64 dependencies built from source
 # Homebrew bottles are arm64-only on Apple Silicon and cannot link into an
 # x86_64 binary, so we cross-compile these with clang -arch x86_64.
 # ---------------------------------------------------------------------------
@@ -258,35 +272,60 @@ configure() {
         -DFORCE_INTERNAL_JPEG=ON
     )
 
-    if [[ "$WANT_SOUND" == "1" ]]; then
-        get_fmod
+    if [[ "$USE_X86_DEPS" == "1" ]]; then
         args+=(
             -DSDL_INCLUDE_DIR="$X86_PREFIX/include/SDL"
             -DSDL_LIBRARY="$X86_PREFIX/lib/libSDL-1.2.0.dylib"
             -DGLEW_INCLUDE_DIR="$X86_PREFIX/include"
             -DGLEW_LIBRARY="$X86_PREFIX/lib/libGLEW.a"
-            -DOPENSSL_ROOT_DIR="$X86_PREFIX" -DOPENSSL_USE_STATIC_LIBS=ON
+            -DOPENSSL_ROOT_DIR="$X86_PREFIX"
+            -DOPENSSL_INCLUDE_DIR="$X86_PREFIX/include"
+            -DOPENSSL_SSL_LIBRARY="$X86_PREFIX/lib/libssl.a"
+            -DOPENSSL_CRYPTO_LIBRARY="$X86_PREFIX/lib/libcrypto.a"
+            -DOPENSSL_USE_STATIC_LIBS=ON
             -DOPUS_INCLUDE_DIR="$X86_PREFIX/include/opus"
             -DOPUS_LIBRARIES="$X86_PREFIX/lib/libopus.a"
             -DZSTD_INCLUDE_DIR="$X86_PREFIX/include"
             -DZSTD_LIBRARY="$X86_PREFIX/lib/libzstd.a"
-            -DFMOD_INCLUDE_DIR="$DEPS_DIR/fmod/include"
-            -DFMOD_LIBRARY="$DEPS_DIR/fmod/lib/libfmodex.dylib"
         )
     else
-        warn "Building WITHOUT sound (-DNO_SOUND=ON). FMOD has no $TARGET_ARCH build."
         local sdl glew ssl opus zstd
         sdl="$(brew --prefix sdl12-compat)"; glew="$(brew --prefix glew)"
-        ssl="$(brew --prefix openssl@3)"; zstd="$(brew --prefix zstd)"
+        ssl="$(brew --prefix openssl@3)"; opus="$(brew --prefix opus)"
+        zstd="$(brew --prefix zstd)"
         args+=(
-            -DNO_SOUND=ON
             -DSDL_INCLUDE_DIR="$sdl/include/SDL"
             -DSDL_LIBRARY="$sdl/lib/libSDL-1.2.0.dylib"
             -DGLEW_INCLUDE_DIR="$glew/include"
+            -DGLEW_LIBRARY="$glew/lib/libGLEW.dylib"
             -DOPENSSL_ROOT_DIR="$ssl"
+            -DOPENSSL_INCLUDE_DIR="$ssl/include"
+            -DOPENSSL_SSL_LIBRARY="$ssl/lib/libssl.dylib"
+            -DOPENSSL_CRYPTO_LIBRARY="$ssl/lib/libcrypto.dylib"
+            -DOPENSSL_USE_STATIC_LIBS=OFF
+            -DOPUS_INCLUDE_DIR="$opus/include/opus"
+            -DOPUS_LIBRARIES="$opus/lib/libopus.dylib"
             -DZSTD_INCLUDE_DIR="$zstd/include"
             -DZSTD_LIBRARY="$zstd/lib/libzstd.dylib"
         )
+    fi
+
+    if [[ "$WANT_SOUND" == "1" ]]; then
+        get_fmod
+        local fmod_library="$DEPS_DIR/fmod/lib/libfmodex.dylib"
+        if [[ -n "$FMOD_DYLIB" ]]; then
+            lipo -verify_arch "$TARGET_ARCH" "$FMOD_DYLIB" >/dev/null 2>&1 || \
+                die "FMOD_DYLIB does not contain the target architecture ($TARGET_ARCH): $FMOD_DYLIB"
+            [[ "$FMOD_DYLIB" == "$fmod_library" ]] || cp -f "$FMOD_DYLIB" "$fmod_library"
+        fi
+        args+=(
+            -DNO_SOUND=OFF
+            -DFMOD_INCLUDE_DIR="$DEPS_DIR/fmod/include"
+            -DFMOD_LIBRARY="$fmod_library"
+        )
+    else
+        warn "Building WITHOUT sound (-DNO_SOUND=ON)."
+        args+=(-DNO_SOUND=ON)
     fi
     cmake "${args[@]}"
 }
@@ -300,10 +339,28 @@ build() {
 
     if [[ "$WANT_SOUND" == "1" ]]; then
         status "Staging runtime dylibs next to the binary..."
-        cp "$DEPS_DIR/fmod/lib/libfmodex.dylib" "$BUILD_DIR/"
+        # Replace atomically to avoid reusing a vnode with a stale AMFI signature cache.
+        rm -f "$BUILD_DIR/libfmodex.dylib"
+        cp "$DEPS_DIR/fmod/lib/libfmodex.dylib" "$BUILD_DIR/libfmodex.dylib"
+        chmod u+w "$BUILD_DIR/libfmodex.dylib"
+    fi
+
+    if [[ "$USE_X86_DEPS" == "1" ]]; then
         cp "$X86_PREFIX/lib/libSDL2-2.0.0.dylib" "$BUILD_DIR/"
-        # FMOD's install id is "./libfmodex.dylib"; make it CWD-independent.
-        install_name_tool -change ./libfmodex.dylib @loader_path/libfmodex.dylib "$BUILD_DIR/zandronum" 2>/dev/null || true
+    else
+        local sdl2compat
+        sdl2compat="$(brew --prefix sdl2-compat)"
+        cp -L "$sdl2compat/lib/libSDL2-2.0.0.dylib" "$BUILD_DIR/"
+    fi
+
+    if [[ "$WANT_SOUND" == "1" ]]; then
+        # Repoint FMOD regardless of whether its install id is relative, absolute,
+        # or @rpath-based so the loose binary loads its staged sibling dylib.
+        local ref
+        while IFS= read -r ref; do
+            [[ "${ref##*/}" == "libfmodex.dylib" ]] || continue
+            install_name_tool -change "$ref" @loader_path/libfmodex.dylib "$BUILD_DIR/zandronum" 2>/dev/null || true
+        done < <(otool -L "$BUILD_DIR/zandronum" | tail -n +2 | awk '{print $1}')
     fi
 }
 
@@ -389,25 +446,26 @@ make_app_bundle() {
         [[ -e "$f" ]] && cp "$f" "$macos/"
     done
 
-    # Stage and re-point dylibs.  In SOUND=1 the deps are the from-source x86_64
-    # libs; in SOUND=0 they're Homebrew's.  The recursive pass follows the link
-    # graph; sdl12-compat dlopens SDL2 at runtime (no link-time edge), so SDL2
-    # is staged explicitly and found via @executable_path next to the binary.
+    # Stage and re-point dylibs. Cross-architecture and sound builds use
+    # from-source x86_64 deps; native builds use Homebrew. SDL12-compat dlopens SDL2.
     _BUNDLED=()
     local search
-    if [[ "$WANT_SOUND" == "1" ]]; then
+    if [[ "$USE_X86_DEPS" == "1" ]]; then
         search=("$X86_PREFIX/lib" "$DEPS_DIR/fmod/lib" "$macos")
         cp "$X86_PREFIX/lib/libSDL2-2.0.0.dylib" "$macos/" && chmod u+w "$macos/libSDL2-2.0.0.dylib"
         _BUNDLED+=("libSDL2-2.0.0.dylib")
         install_name_tool -id "@loader_path/libSDL2-2.0.0.dylib" "$macos/libSDL2-2.0.0.dylib" 2>/dev/null || true
     else
-        local sdl; sdl="$(brew --prefix sdl12-compat)"
-        search=("$(brew --prefix)/lib" "$sdl/lib" "$macos")
-        if [[ -f "$sdl/lib/libSDL2-2.0.0.dylib" ]]; then
-            cp -L "$sdl/lib/libSDL2-2.0.0.dylib" "$macos/" && chmod u+w "$macos/libSDL2-2.0.0.dylib"
-            _BUNDLED+=("libSDL2-2.0.0.dylib")
-            install_name_tool -id "@loader_path/libSDL2-2.0.0.dylib" "$macos/libSDL2-2.0.0.dylib" 2>/dev/null || true
-        fi
+        local sdl sdl2compat
+        sdl="$(brew --prefix sdl12-compat)"
+        sdl2compat="$(brew --prefix sdl2-compat)"
+        search=("$sdl/lib" "$sdl2compat/lib" \
+            "$(brew --prefix glew)/lib" "$(brew --prefix openssl@3)/lib" \
+            "$(brew --prefix opus)/lib" "$(brew --prefix zstd)/lib" \
+            "$(brew --prefix)/lib" "$DEPS_DIR/fmod/lib" "$macos")
+        cp -L "$sdl2compat/lib/libSDL2-2.0.0.dylib" "$macos/" && chmod u+w "$macos/libSDL2-2.0.0.dylib"
+        _BUNDLED+=("libSDL2-2.0.0.dylib")
+        install_name_tool -id "@loader_path/libSDL2-2.0.0.dylib" "$macos/libSDL2-2.0.0.dylib" 2>/dev/null || true
     fi
     _bundle_deps "$macos/zandronum" "$macos" "${search[@]}"
 
@@ -474,8 +532,13 @@ main() {
     ensure_xcode
     ensure_homebrew
     ensure_base_tools
+    if [[ "$WANT_SOUND" == "1" && -n "$FMOD_DYLIB" ]]; then
+        [[ -f "$FMOD_DYLIB" ]] || die "FMOD_DYLIB file not found: $FMOD_DYLIB"
+        lipo -verify_arch "$TARGET_ARCH" "$FMOD_DYLIB" >/dev/null 2>&1 || \
+            die "FMOD_DYLIB does not contain the target architecture ($TARGET_ARCH): $FMOD_DYLIB"
+    fi
     get_source
-    if [[ "$WANT_SOUND" == "1" ]]; then
+    if [[ "$USE_X86_DEPS" == "1" ]]; then
         ensure_rosetta
         build_x86_deps
     else

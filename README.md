@@ -53,6 +53,12 @@ This project gives you a super easy way to develop the [Zandronum source port](h
 ## Sound and Apple Silicon
 `./build.sh` builds with full audio by default. FMOD (the audio library Zandronum uses) was never released for Apple Silicon, so on those Macs the build is compiled for Intel and runs under Rosetta 2, which is installed automatically if it's missing. On an Intel Mac it just builds natively.
 
+If you have an arm64 FMOD Ex compatible `libfmodex.dylib`, you can try build native arm64 with audio:
+
+```bash
+ARCH=arm64 SOUND=1 FMOD_DYLIB=/absolute/path/to/libfmodex.dylib ./build.sh
+```
+
 If you'd rather have a native Apple Silicon build and don't care about in-game audio, run `SOUND=0 ./build.sh`.
 
 ## License
